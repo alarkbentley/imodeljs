@@ -3,15 +3,25 @@
 * See LICENSE.md in the project root for license terms and full copyright notice.
 *--------------------------------------------------------------------------------------------*/
 
-import { assert, ClientRequestContext, DbResult, Id64, Id64Array, Logger } from "@bentley/bentleyjs-core";
+import * as path from "path";
+import { assert, ClientRequestContext, DbResult, Guid, Id64, Id64Array, Logger } from "@bentley/bentleyjs-core";
 import {
-  Category, ECSqlStatement, Element, ElementRefersToElements, GeometryPart, IModelDb, IModelTransformer, IModelTransformOptions,
-  InformationPartitionElement, PhysicalModel, PhysicalPartition, Relationship, SubCategory,
+  Category, ECSqlStatement, Element, ElementRefersToElements, GeometryPart, IModelDb, IModelJsFs, IModelTransformer, IModelTransformOptions,
+  InformationPartitionElement, KnownLocations, PhysicalModel, PhysicalPartition, Relationship, SubCategory,
 } from "@bentley/imodeljs-backend";
 import { ElementProps, IModel } from "@bentley/imodeljs-common";
 import { AuthorizedClientRequestContext } from "@bentley/itwin-client";
 
 export const progressLoggerCategory = "Progress";
+
+// an operation for changing a schema during transformation
+export interface SchemaEditOperation {
+  schemaName: string;
+  // regex is not powerful enough for non-trivial XML so a later update could include
+  // XPATH or Jq-style query support, but regex should be enough for current usage
+  pattern: RegExp;
+  substitution: string; // current javascript style backreferences (e.g. "hello $1")
+}
 
 export interface TransformerOptions extends IModelTransformOptions {
   simplifyElementGeometry?: boolean;
@@ -19,6 +29,7 @@ export interface TransformerOptions extends IModelTransformOptions {
   deleteUnusedGeometryParts?: boolean;
   excludeSubCategories?: string[];
   excludeCategories?: string[];
+  schemaEditOperations?: SchemaEditOperation[];
 }
 
 export class Transformer extends IModelTransformer {
@@ -28,6 +39,7 @@ export class Transformer extends IModelTransformer {
   private _numSourceRelationshipsProcessed = 0;
   private _startTime = new Date();
   private _targetPhysicalModelId = Id64.invalid; // will be valid when PhysicalModels are being combined
+  private _schemaEditOperations: SchemaEditOperation[] = [];
 
   public static async transformAll(requestContext: AuthorizedClientRequestContext | ClientRequestContext, sourceDb: IModelDb, targetDb: IModelDb, options?: TransformerOptions): Promise<void> {
     const transformer = new Transformer(sourceDb, targetDb, options);
@@ -85,6 +97,8 @@ export class Transformer extends IModelTransformer {
       this.excludeCategories(options.excludeCategories);
     }
 
+    this._schemaEditOperations = options?.schemaEditOperations ?? [];
+
     // query for and log the number of source Elements that will be processed
     this._numSourceElements = this.sourceDb.withPreparedStatement(`SELECT COUNT(*) FROM ${Element.classFullName}`, (statement: ECSqlStatement): number => {
       return DbResult.BE_SQLITE_ROW === statement.step() ? statement.getValue(0).getInteger() : 0;
@@ -96,6 +110,19 @@ export class Transformer extends IModelTransformer {
       return DbResult.BE_SQLITE_ROW === statement.step() ? statement.getValue(0).getInteger() : 0;
     });
     Logger.logInfo(progressLoggerCategory, `numSourceRelationships=${this._numSourceRelationships}`);
+  }
+
+  public async processSchemas(...[requestContext]: Parameters<IModelTransformer["processSchemas"]>): Promise<void> {
+    await super.processSchemas(requestContext);
+    requestContext.enter();
+    const schemasDir: string = path.join(KnownLocations.tmpdir, Guid.createValue());
+    IModelJsFs.mkdirSync(schemasDir);
+    try {
+      this.sourceDb.nativeDb.exportSchemas(schemasDir);
+    } finally {
+      requestContext.enter();
+      IModelJsFs.removeSync(schemasDir);
+    }
   }
 
   /** Initialize IModelTransformer to exclude SubCategory Elements and geometry entries in a SubCategory from the target iModel.
@@ -155,9 +182,9 @@ export class Transformer extends IModelTransformer {
 
   /** This override of IModelTransformer.onTransformElement exists for debugging purposes */
   protected onTransformElement(sourceElement: Element): ElementProps {
-    // if (sourceElement.getDisplayLabel() === "xxx") { // use logging to find something unique about the problem element
-    //   Logger.logInfo(progressLoggerCategory, "Found problem element"); // set breakpoint here
-    // }
+    if (sourceElement.id === "0x9b") { // use logging to find something unique about the problem element
+      Logger.logInfo(progressLoggerCategory, "Found problem element"); // set breakpoint here
+    }
     return super.onTransformElement(sourceElement);
   }
 
