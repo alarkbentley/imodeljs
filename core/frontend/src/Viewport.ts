@@ -39,6 +39,7 @@ import { ToolTipOptions } from "./NotificationManager";
 import { PerModelCategoryVisibility } from "./PerModelCategoryVisibility";
 import { Decorations } from "./render/Decorations";
 import { FeatureSymbology } from "./render/FeatureSymbology";
+import { FrameStats } from "./render/FrameStats";
 import { GraphicType } from "./render/GraphicBuilder";
 import { Pixel } from "./render/Pixel";
 import { GraphicList } from "./render/RenderGraphic";
@@ -460,9 +461,7 @@ export abstract class Viewport implements IDisposable {
     this.displayStyle.settings.analysisFraction = fraction;
   }
 
-  /** @see [DisplayStyleSettings.timePoint]($common)
-   * @beta
-   */
+  /** @see [DisplayStyleSettings.timePoint]($common) */
   public get timePoint(): number | undefined {
     return this.displayStyle.settings.timePoint;
   }
@@ -530,23 +529,20 @@ export abstract class Viewport implements IDisposable {
 
   /** Selectively override aspects of this viewport's display style.
    * @see [DisplayStyleSettings.applyOverrides]($common)
-   * @beta
    */
   public overrideDisplayStyle(overrides: DisplayStyleSettingsProps): void {
     this.displayStyle.settings.applyOverrides(overrides);
   }
 
-  /** @see [DisplayStyleSettings.clipStyle]($common)
-   * @beta
-   */
+  /** @see [DisplayStyleSettings.clipStyle]($common) */
   public get clipStyle(): ClipStyle { return this.displayStyle.settings.clipStyle; }
   public set clipStyle(style: ClipStyle) {
     this.displayStyle.settings.clipStyle = style;
   }
 
-  /** Turn on or off antialiasing in each [[Viewport]] registered with the ViewManager.
-   * Setting numSamples to 1 turns it off, setting numSamples > 1 turns it on with that many samples.
-   * @beta
+  /** The number of [antialiasing](https://en.wikipedia.org/wiki/Multisample_anti-aliasing) samples to be used when rendering the contents of the viewport.
+   * Must be an integer greater than zero. A value of 1 means antialiasing is disabled. A higher number of samples correlates generally to a higher quality image but
+   * is also more demanding on the graphics hardware.
    */
   public get antialiasSamples(): number {
     return undefined !== this._target ? this._target.antialiasSamples : 1;
@@ -992,9 +988,18 @@ export abstract class Viewport implements IDisposable {
     return "";
   }
 
+  /** If this event has one or more listeners, collection of timing statistics related to rendering frames is enabled. Frame statistics will be received by the listeners whenever a frame is finished rendering.
+   * @note The timing data collected using this event only collects the amount of time spent on the CPU. Due to performance considerations, time spent on the GPU is not collected. Therefore, these statistics are not a direct mapping to user experience.
+   * @note In order to avoid interfering with the rendering loop, take care to avoid performing any intensive tasks in your event listeners.
+   * @see [[FrameStats]]
+   * @alpha
+   */
+  public readonly onFrameStats = new BeEvent<(frameStats: Readonly<FrameStats>) => void>();
+
   /** @internal */
   protected constructor(target: RenderTarget) {
     this._target = target;
+    target.setOnFrameStats(this.onFrameStats);
     this._viewportId = Viewport._nextViewportId++;
     this._perModelCategoryVisibility = PerModelCategoryVisibility.createOverrides(this);
     IModelApp.tileAdmin.registerViewport(this);
@@ -1368,7 +1373,14 @@ export abstract class Viewport implements IDisposable {
     this.maybeInvalidateScene();
   }
 
-  /** @alpha */
+  /** The [[TiledGraphicsProvider]]s currently registered with this viewport.
+   * @see [[addTiledGraphicsProvider]].
+   */
+  public get tiledGraphicsProviders(): Iterable<TiledGraphicsProvider> {
+    return this._tiledGraphicsProviders;
+  }
+
+  /** @internal */
   public forEachTiledGraphicsProvider(func: (provider: TiledGraphicsProvider) => void): void {
     for (const provider of this._tiledGraphicsProviders)
       func(provider);
@@ -1400,18 +1412,14 @@ export abstract class Viewport implements IDisposable {
     if (!this.view.areAllTileTreesLoaded)
       return false;
 
-    let allLoaded = true;
-    this.forEachMapTreeRef((ref) => {
-      allLoaded &&= ref.isLoadingComplete;
-    });
+    if (this._mapTiledGraphicsProvider && !TiledGraphicsProvider.isLoadingComplete(this._mapTiledGraphicsProvider, this))
+      return false;
 
-    if (allLoaded) {
-      this.forEachTiledGraphicsProviderTree((ref) => {
-        allLoaded &&= ref.isLoadingComplete;
-      });
-    }
+    for (const provider of this._tiledGraphicsProviders)
+      if (!TiledGraphicsProvider.isLoadingComplete(provider, this))
+        return false;
 
-    return allLoaded;
+    return true;
   }
 
   /** Disclose *all* TileTrees currently in use by this Viewport. This set may include trees not reported by [[forEachTileTreeRef]] - e.g., those used by view attachments, map-draped terrain, etc.
@@ -1425,7 +1433,6 @@ export abstract class Viewport implements IDisposable {
 
   /** Register a provider of tile graphics to be drawn in this viewport.
    * @see [[dropTiledGraphicsProvider]]
-   * @beta
    */
   public addTiledGraphicsProvider(provider: TiledGraphicsProvider): void {
     this._tiledGraphicsProviders.add(provider);
@@ -1434,7 +1441,6 @@ export abstract class Viewport implements IDisposable {
 
   /** Remove a previously-registered provider of tile graphics.
    * @see [[addTiledGraphicsProvider]]
-   * @beta
    */
   public dropTiledGraphicsProvider(provider: TiledGraphicsProvider): void {
     this._tiledGraphicsProviders.delete(provider);
@@ -2159,6 +2165,16 @@ export abstract class Viewport implements IDisposable {
   /** @internal */
   public createSceneContext(): SceneContext { return new SceneContext(this); }
 
+  /** @internal */
+  public createScene(context: SceneContext): void {
+    this.view.createScene(context);
+    if (this._mapTiledGraphicsProvider)
+      TiledGraphicsProvider.addToScene(this._mapTiledGraphicsProvider, context);
+
+    for (const provider of this._tiledGraphicsProviders)
+      TiledGraphicsProvider.addToScene(provider, context);
+  }
+
   /** Called when the visible contents of the viewport are redrawn.
    * @note Due to the frequency of this event, avoid performing expensive work inside event listeners.
    */
@@ -2235,15 +2251,9 @@ export abstract class Viewport implements IDisposable {
       if (!this._freezeScene) {
         IModelApp.tileAdmin.clearTilesForViewport(this);
         IModelApp.tileAdmin.clearUsageForViewport(this);
-        const context = this.createSceneContext();
-        view.createScene(context);
 
-        for (const provider of this._tiledGraphicsProviders) {
-          if (undefined !== provider.addToScene)
-            provider.addToScene(context);
-          else
-            provider.forEachTileTreeRef(this, (ref) => ref.addToScene(context));
-        }
+        const context = this.createSceneContext();
+        this.createScene(context);
 
         context.requestMissingTiles();
         target.changeScene(context.scene);
@@ -2329,7 +2339,6 @@ export abstract class Viewport implements IDisposable {
    * @param receiver A function accepting a [[Pixel.Buffer]] object from which the selected data can be retrieved, or receiving undefined if the viewport is not active, the rect is out of bounds, or some other error. The pixels received will be device pixels, not CSS pixels. See [[Viewport.devicePixelRatio]] and [[Viewport.cssPixelsToDevicePixels]].
    * @param excludeNonLocatable If true, geometry with the "non-locatable" flag set will not be drawn.
    * @note The [[Pixel.Buffer]] supplied to the `receiver` function becomes invalid once that function exits. Do not store a reference to it.
-   * @beta
    */
   public readPixels(rect: ViewRect, selector: Pixel.Selector, receiver: Pixel.Receiver, excludeNonLocatable = false): void {
     const viewRect = this.viewRect;
@@ -2649,7 +2658,6 @@ export class ScreenViewport extends Viewport {
   /** Forces removal of a specific decorator's cached decorations from this viewport, if they exist.
    * This will force those decorations to be regenerated.
    * @see [[ViewportDecorator.useCachedDecorations]].
-   * @beta
    */
   public invalidateCachedDecorations(decorator: ViewportDecorator) {
     this._decorationCache.delete(decorator);
